@@ -8,7 +8,8 @@ but 422 bodies land in proxy logs, browser devtools and error trackers.
 
 The same values reached the server log: FastAPI opens the session dependency
 before it validates the body, then throws the validation error into it, and
-session_scope logged whatever was thrown.
+session_scope logged whatever was thrown. The deployments telemetry dependency
+receives the same error and put its text in a payload that leaves the instance.
 """
 
 import io
@@ -16,11 +17,13 @@ import logging
 from typing import Annotated, Literal
 
 import pytest
-from fastapi import FastAPI, Header, Query, WebSocket, status
+from fastapi import Depends, FastAPI, Header, Query, WebSocket, status
 from fastapi.exceptions import RequestValidationError
 from httpx import ASGITransport, AsyncClient
 from langflow.api.utils.core import DbSession
+from langflow.api.v1.deployments import DeploymentTelemetryCtx, deployment_create_telemetry
 from langflow.api.validation_errors import redact_validation_errors, request_validation_exception_handler
+from langflow.services.deps import get_telemetry_service
 from langflow.services.variable.constants import CREDENTIAL_TYPE
 from lfx.services.deps import session_scope
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictStr, ValidationError, field_validator
@@ -276,6 +279,45 @@ async def test_failed_websocket_validation_is_not_logged_by_the_session_scope(se
 
     assert [message["type"] for message in sent] == ["websocket.close"], sent
     assert CANARY not in session_scope_log.getvalue()
+
+
+@pytest.mark.usefixtures("client")
+async def test_failed_validation_text_stays_out_of_deployment_telemetry(monkeypatch):
+    app = FastAPI()
+    telemetry_dep = Annotated[DeploymentTelemetryCtx, Depends(deployment_create_telemetry)]
+
+    @app.post("/deployments")
+    async def create_deployment(connection: _ConnectionCreate, telemetry: telemetry_dep) -> dict:  # noqa: ARG001
+        return {}
+
+    @app.post("/broken")
+    async def broken(telemetry: telemetry_dep) -> dict:  # noqa: ARG001
+        raise RuntimeError(SENTINEL)
+
+    telemetry_service = get_telemetry_service()
+    queue = telemetry_service.telemetry_queue
+
+    def next_payload():
+        _send, payload, _path = queue.get_nowait()
+        queue.task_done()
+        return payload
+
+    # The test app sets DO_NOT_TRACK, which drops events before they are queued.
+    # That also means no worker was started, so a queued event is never sent.
+    with monkeypatch.context() as tracking:
+        tracking.setattr(telemetry_service, "do_not_track", False)
+        transport = ASGITransport(app=app, raise_app_exceptions=False)
+        async with AsyncClient(transport=transport, base_url="http://testserver") as probe:
+            await probe.post("/broken")
+            response = await probe.post("/deployments", json={"credentials": {"access_token": CANARY}})
+
+    # Positive control: any other error still reports its own text.
+    assert next_payload().deployment_error_message == SENTINEL
+    assert response.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT, response.text
+    payload = next_payload()
+    assert payload.deployment_success is False
+    assert CANARY not in payload.model_dump_json()
+    assert payload.deployment_error_message == "RequestValidationError"
 
 
 def _errors_for(model: type[BaseModel], data: dict) -> list[dict]:

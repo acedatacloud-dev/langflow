@@ -7,6 +7,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Response, status
+from fastapi.exceptions import RequestValidationError
 from fastapi_pagination import Params
 from lfx.log.logger import logger
 from lfx.services.adapters.deployment.schema import (
@@ -139,7 +140,8 @@ def _make_telemetry_dep(action: str, log_method_name: str):
             yield ctx
         except Exception as exc:
             success = False
-            error_message = str(exc)
+            # A validation error's text quotes the submitted values, and this message leaves the instance.
+            error_message = type(exc).__name__ if isinstance(exc, RequestValidationError) else str(exc)
             raise
         finally:
             try:
